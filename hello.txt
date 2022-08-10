@@ -1,0 +1,349 @@
+SELECT
+  avid,
+  cast(SPLIT(tag, '\\|') [1] as string ) as tag_value,
+  SPLIT(tag, '\\|') [0] as tag_code 
+  -- 根据标识“｜”对 code｜value 形式的数据进行拆分，对应部分放入结果表对应的分区
+FROM
+  (
+    SELECT
+      avid,
+      CONCAT_WS(
+        '\t',
+        tag,
+        tags,
+        tagarray
+      ) as labelstr
+    FROM
+      (
+        SELECT
+          avid,
+          CONCAT_WS('|', 'arch_base_string_tags', tag ) as tag ,
+          CONCAT_WS('|', 'arch_base_string_tags', split(tag, ',') ) as tags,
+        	CONCAT('|', 'arch_base_string_tags',  (cast split(tag, ',') as ARRAY)) as tags
+        
+        -- 取出需要使用的指标字段并按照要求规范化为：code｜value 的形式
+        FROM
+          b_dim.dim_ctnt_arch_business_tag_info_d
+        WHERE
+          log_date = '<%=log_date%>'
+      ) t1
+    -- 将一个avid对应热所有指标字段通过 “\t”连接，转化为 avid ： string 的形式
+  ) t2 lateral view explode(SPLIT(labelstr, '\\t')) label as tag
+  -- 对 avid ： string 形式的数据进行行转列操作
+
+
+
+  -- insert
+--  overwrite table bili_main.dws_prty_arch_base_array_a_d partition(log_date = '<%=log_date%>', tag_code)
+    select
+    mid,
+    split(tag, ',') as tags,
+    "arch_base_string_tags" as tag_code
+  from
+    b_dim.dim_ctnt_arch_business_tag_info_d
+  group by
+    mid
+
+
+
+
+
+
+
+
+
+set mapred.max.split.size=64000000;
+set mapred.min.split.size=32000000;
+
+-- 计算的所有标签
+with tag_info as(
+  SELECT
+    mid,
+    str_to_map(
+      concat_ws(
+        "\u0001",
+        collect_set(
+          concat_ws(':', tag_code, NVL(tag_value, ''))
+        )
+      ),
+      '\u0001',
+      ':'
+    ) as tag_map
+  -- 数据格式转换为： mid ： map。
+  FROM
+    bili_main.dws_prty_up_tag_string_a_d
+  -- 表结构 ： 两个普通字段  + 两个分区字段 
+  WHERE
+    log_date = '<%=log_date%>'
+  group by
+    mid
+),
+-- 所有的string类型的标签
+all_tag as(
+  SELECT
+    str_to_map(
+      concat_ws(
+        ",",
+        collect_set(concat_ws(':', tag_code, ''))
+      )
+    ) as tag_map,
+    1 as join_id
+  from
+    b_ods.ods_db1021_tag_info_a_d
+  WHERE
+    log_date = '<%=log_date%>'
+    and type_id in (4, 6, 7, 8, 9, 10, 14)
+    and state in (1, 2)
+    and data_type in (4, 10)
+    and hive_cal_type = 1
+),
+-- 所有的up主的mid
+up_info as(
+  SELECT
+    mid,
+    1 as join_id
+  FROM
+    archive.dws_up_daily
+  WHERE
+    log_date = '<%=log_date%>'
+    and mid is not null
+),
+-- 每个up主string类型标签
+all_tag_info as(
+  SELECT
+    up_info.mid,
+    all_tag.tag_map
+  FROM
+    up_info
+    left join all_tag on up_info.join_id = all_tag.join_id
+),
+-- 插入数据
+up_tag_agg as(
+  SELECT
+    all_tag_info.mid,
+    b_map_union_v2(tag_info.tag_map, all_tag_info.tag_map) as tag_map
+  FROM
+    all_tag_info
+    left join tag_info on all_tag_info.mid = tag_info.mid
+)
+insert
+  overwrite table bili_main.dws_prty_up_string_tag_a_d partition(log_date = '<%=log_date%>')
+SELECT
+  mid,
+  CONCAT_WS(
+    ',',
+    collect_list(
+      concat_ws(
+        ':',
+        concat('"', map_key, '"'),
+        concat('"', NVL(map_value, ''), '"')
+      )
+    )
+  ) as bigint_json
+FROM
+  up_tag_agg lateral view explode(tag_map) tag_map as map_key,
+  map_value
+GROUP BY
+  mid;
+  
+  
+  
+  
+  
+
+
+
+
+
+-- 获取up主标签 type_id in (4, 6, 7, 8, 9, 10)
+with tag_info as (
+  SELECT
+    concat("'", tag_code, "'") as tag_code,   -- tag_code ： SQL任务对象
+    data_type,    -- 数据类型
+    hive_table,   -- 数据来源表名称
+    case
+      when data_type = 1
+      or data_type = 2
+      or data_type = 5 then 'bili_main.dws_prty_up_tag_bigint_a_d'
+      when data_type = 3 then 'bili_main.dws_prty_up_tag_double_a_d'
+      when data_type = 7 then 'bili_main.dws_prty_up_tag_array_a_d'
+      when data_type = 8 then 'bili_main.dws_prty_up_tag_bigint_array_a_d'
+      when data_type = 4
+      OR data_type = 10 then 'bili_main.dws_prty_up_tag_string_a_d'
+      else ''
+    end as target_table   -- 插入的表名称
+  from
+    b_ods.ods_db1021_tag_info_a_d
+  -- 里面存放了所有类型的标签信息元数据；
+  -- 下文就是通过表中的这些元数据 拼凑出完整的 SQL语句
+  WHERE
+    log_date = '<%=log_date%>'
+    and type_id in (4, 6, 7, 8, 9, 10, 14)
+    and state in (1, 2)
+    and hive_cal_type = 1
+  -- 获取变量值
+)
+-- 插入数据
+-- 使用上面临时表中的数据 拼凑出对应的sql语句 然后写入表对应的分区当中
+insert
+  overwrite table bili_main.dws_prty_up_tag_sql_a_d partition(log_date = '<%=log_date%>')
+SELECT
+  tag_code,
+  CONCAT(
+    " insert overwrite table ",
+    target_table,  -- 数据插入的表名
+    " partition(log_date = '<%=log_date%>',tag_code=",
+    tag_code,   -- 表的分区信息
+    ") ",
+    " SELECT mid,tag_value FROM ",
+    hive_table,   -- 信息来源表
+    " WHERE log_date = '<%=log_date%>' and tag_code = ",
+    tag_code  -- 表的分区信息
+  ) as exec_sql,   -- 写好的sql 信息字段 exec_sql
+  data_type    -- 数据类型
+FROM
+  tag_info
+WHERE
+  target_table != ''
+  
+  
+  
+  
+
+
+
+
+
+set mapred.max.split.size=64000000;
+set mapred.min.split.size=32000000;
+
+-- 计算的所有string类型标签
+with tag_info as(
+  SELECT
+    mid,
+    str_to_map(
+      concat_ws(
+        "\u0001",
+        collect_set(
+          concat_ws(':', tag_code, NVL(tag_value, ''))
+        )
+      ),
+      '\u0001',
+      ':'
+    ) as tag_map
+  -- 数据格式转换为： mid ： map。
+  FROM
+    bili_main.dws_prty_up_tag_string_a_d
+  -- 表结构 ： 两个普通字段  + 两个分区字段 
+  WHERE
+    log_date = '<%=log_date%>'
+  group by
+    mid
+),
+
+-- 所有的string类型的标签
+all_tag as(
+  SELECT
+    str_to_map(
+      concat_ws(
+        ",",
+        collect_set(concat_ws(':', tag_code, ''))
+      )
+    ) as tag_map,  -- 所有string类型的标签合成一个 tag_map
+    1 as join_id
+  from
+    b_ods.ods_db1021_tag_info_a_d
+  WHERE
+    log_date = '<%=log_date%>'
+    and type_id in (4, 6, 7, 8, 9, 10, 14)
+    and state in (1, 2)
+    and data_type in (4, 10)
+    and hive_cal_type = 1
+),
+
+-- 所有的up主的mid
+up_info as(
+  SELECT
+    mid,  -- 所有的up主的mid
+    1 as join_id
+  FROM
+    archive.dws_up_daily
+  WHERE
+    log_date = '<%=log_date%>'
+    and mid is not null
+),
+
+-- 每个up主string类型标签
+all_tag_info as(
+  SELECT
+    up_info.mid,
+    all_tag.tag_map
+  FROM
+    up_info
+    left join all_tag on up_info.join_id = all_tag.join_id
+),
+
+
+--------------------------------------------------------------------------------------------
+-- 插入数据
+up_tag_agg as(
+  SELECT
+    all_tag_info.mid,
+    b_map_union_v2(tag_info.tag_map, all_tag_info.tag_map) as tag_map
+  -- tag_info 中有值 ，则取tag_info 中的值 ， tag_info中没有值，则取 all_tag_info 中的默认值 “”（空）
+  -- 改进方向 ： 
+  FROM
+    all_tag_info
+    left join tag_info 
+  on all_tag_info.mid = tag_info.mid
+)
+--------------------------------------------------------------------------------------------
+
+
+insert
+  overwrite table bili_main.dws_prty_up_string_tag_a_d partition(log_date = '<%=log_date%>')
+SELECT
+  mid,
+  CONCAT_WS(
+    ',',
+    collect_list(
+      concat_ws(
+        ':',
+        concat('"', map_key, '"'),
+        concat('"', NVL(map_value, ''), '"')
+      )
+    )
+  ) as bigint_json
+FROM
+  up_tag_agg lateral view explode(tag_map) tag_map as map_key,
+  map_value
+GROUP BY
+  mid;
+  
+  
+  
+  
+ 
+    
+    
+  
+
+  
+  
+
+
+
+
+
+
+
+
+  
+  
+  
+
+
+
+
+
+
